@@ -1,11 +1,28 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { BudgetCharts } from "./Charts";
+import PlaidLinkButton from './components/PlaidLinkButton';
+import { listTransactions, upsertBudgetItem, deleteBudgetItem } from './lib/api';
+import TransactionsCard from "./components/TransactionsCard";
 
 const API = import.meta.env.VITE_API_BASE_URL as string;
 
-type BudgetItem = { category: string; monthly_limit: number };
-type Insight = { category: string; monthly_limit: number; spent: number; status: "OK"|"WARNING"|"OVER" };
+
+type BudgetItem = { category: string; monthly_limit: number; current_spend?: number };
 type BudgetUpsert = { client_id: string; items: BudgetItem[] };
+type TxRow = {
+  id: number;
+  account_id: number;
+  account_name: string;
+  merchant: string | null;
+  category: string | null;
+  amount_cents: number;
+  post_date: string | null;  // "YYYY-MM-DD"
+  status: string | null;
+};
+type TxList = {
+  items: TxRow[];
+  next: { beforeDate: string; beforeId: string } | null;
+};
 
 function uuid(): string {
   // Use browser UUID if available
@@ -30,6 +47,18 @@ function useClientId() {
     setId(cid);
   }, []);
   return id;
+}
+
+function formatCurrency(n: number) {
+  try {
+    return new Intl.NumberFormat(undefined, {
+      style: "currency",
+      currency: "USD",
+      maximumFractionDigits: 2,
+    }).format(Number.isFinite(n) ? n : 0);
+  } catch {
+    return `$${(Number.isFinite(n) ? n : 0).toFixed(2)}`;
+  }
 }
 
 type Toast = { id: number; kind: "ok" | "err"; msg: string };
@@ -153,6 +182,7 @@ function CategoryPicker({
 export default function App() {
   const clientId = useClientId();
 
+  const [savingBudget, setSavingBudget] = useState(false);
   const [loading, setLoading] = useState(false);
   const [health, setHealth] = useState<null | { ok: boolean; text: string }>(
     null
@@ -160,9 +190,6 @@ export default function App() {
   const [rows, setRows] = useState<BudgetItem[]>([]);
   const [form, setForm] = useState<BudgetItem>({ category: "", monthly_limit: 0 });
   const [toasts, setToasts] = useState<Toast[]>([]);
-
-  const [spend, setSpend] = useState<Record<string, number>>({});
-  const [insights, setInsights] = useState<Insight[]>([]);
 
   const total = useMemo(
     () => rows.reduce((sum, r) => sum + Number(r.monthly_limit || 0), 0),
@@ -172,7 +199,12 @@ export default function App() {
   const chartData = useMemo(
   () => rows.map(r => ({ name: r.category, value: Number(r.monthly_limit || 0) })),
   [rows]
-);
+  );
+
+  const [txRows, setTxRows] = useState<TxRow[]>([]);
+  const [txNext, setTxNext] = useState<TxList["next"]>(null);
+  const [txLoading, setTxLoading] = useState(false);
+  const [txInit, setTxInit] = useState(false);
 
   function pushToast(t: Omit<Toast, "id">) {
     const id = Date.now() + Math.random();
@@ -206,25 +238,48 @@ export default function App() {
       setLoading(false);
     }
   }
-
-  async function loadInsights() {
-    if (!clientId) return;
-    try {
-      const r = await fetch(`${API}/v1/insights?client_id=${clientId}`);
-      const data = (await r.json()) as Insight[];
-      setInsights(data);
-      // seed spend map from DB
-      setSpend(Object.fromEntries(data.map(d => [d.category, Number(d.spent || 0)])));
-    } catch {
-      // non-fatal
-    }
+  
+  async function loadTxFirstPage() {
+  if (!clientId) return;
+  setTxLoading(true);
+  try {
+    const page = (await listTransactions(clientId)) as TxList; // api.ts returns untyped JSON
+    setTxRows(page.items);
+    setTxNext(page.next);
+  } catch (e) {
+    pushToast({ kind: "err", msg: "Failed to load transactions" });
+  } finally {
+    setTxLoading(false);
+    setTxInit(true);
   }
+}
+
+async function loadTxMore() {
+  if (!txNext) return;
+  setTxLoading(true);
+  try {
+    // keeping api.ts minimal; use fetch directly for "next" for now
+    const qs = new URLSearchParams({
+      client_id: clientId,
+      beforeDate: txNext.beforeDate,
+      beforeId: String(txNext.beforeId),
+    }).toString();
+    const r = await fetch(`${API}/v1/transactions?${qs}`);
+    const page = (await r.json()) as TxList;
+    setTxRows(prev => [...prev, ...page.items]);
+    setTxNext(page.next);
+  } catch (e) {
+    pushToast({ kind: "err", msg: "Failed to load more" });
+  } finally {
+    setTxLoading(false);
+  }
+}
 
   useEffect(() => {
     if (clientId) {
       testAPI();
       loadBudgets();
-      loadInsights();
+      loadTxFirstPage();
     }
   }, [clientId]);
 
@@ -237,79 +292,52 @@ export default function App() {
     }
   }
 
-  function addRowLocal() {
-    if (!form.category.trim()) {
-      pushToast({ kind: "err", msg: "Category is required" });
-      return;
-    }
-    if (form.monthly_limit <= 0) {
-      pushToast({ kind: "err", msg: "Monthly limit must be > 0" });
-      return;
-    }
-    // If category exists, replace; else add
+  async function addRowLocal() {
+    if (!clientId) return;
+    if (!form.category.trim()) { pushToast({ kind: "err", msg: "Category is required" }); return; }
+    if (form.monthly_limit <= 0) { pushToast({ kind: "err", msg: "Monthly limit must be > 0" }); return; }
+
+    setSavingBudget(true);
+
+    // Optimistic UI update
     setRows(prev => {
-      const idx = prev.findIndex(r => r.category.toLowerCase() === form.category.toLowerCase());
       const next = [...prev];
-      if (idx >= 0) next[idx] = { ...form };
+      const i = next.findIndex(r => r.category.toLowerCase() === form.category.toLowerCase());
+      if (i >= 0) next[i] = { ...form };
       else next.push({ ...form });
       return next;
     });
-    setForm({ category: "", monthly_limit: 0 });
-  }
 
-  async function saveBudget() {
-    if (!clientId) return;
-    const payload: BudgetUpsert = { client_id: clientId, items: rows };
     try {
-      const r = await fetch(`${API}/v1/budgets`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      });
-      if (!r.ok) {
-        const t = await r.text();
-        pushToast({ kind: "err", msg: `Save failed: ${r.status} ${t}` });
-        return;
-      }
-      pushToast({ kind: "ok", msg: "Budgets saved" });
-      loadBudgets();
-    } catch {
-      pushToast({ kind: "err", msg: "Network error on save" });
+      await upsertBudgetItem(clientId, { category: form.category, monthly_limit: Number(form.monthly_limit) });
+      await loadBudgets(); // refresh so current_spend is accurate
+      pushToast({ kind: "ok", msg: "Budget saved" });
+      setForm({ category: "", monthly_limit: 0 });
+    } catch (e: any) {
+      pushToast({ kind: "err", msg: e?.message || "Failed to save budget" });
+      await loadBudgets(); // rollback to server truth
+    } finally {
+      setSavingBudget(false);
     }
   }
 
-  async function saveSpend() {
+  async function removeRow(cat: string) {
     if (!clientId) return;
-    const items = Object.entries(spend)
-      .filter(([, amt]) => Number.isFinite(amt))
-      .map(([category, amount]) => ({ category, amount }));
+    const prev = rows;
+
+    // Optimistic remove
+    setRows(prev.filter(r => r.category !== cat));
+
     try {
-      const r = await fetch(`${API}/v1/spend`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ client_id: clientId, items }),
-      });
-      if (!r.ok) {
-        const t = await r.text();
-        pushToast({ kind: "err", msg: `Save spend failed: ${r.status} ${t}` });
-        return;
-      }
-      pushToast({ kind: "ok", msg: "Spend saved" });
-      loadInsights();
-    } catch {
-      pushToast({ kind: "err", msg: "Network error on save spend" });
+      await deleteBudgetItem(clientId, cat);
+      await loadBudgets(); // keep current_spend fresh
+      pushToast({ kind: "ok", msg: `Removed ${cat}` });
+    } catch (e: any) {
+      setRows(prev); // rollback
+      pushToast({ kind: "err", msg: e?.message || `Failed to remove ${cat}` });
     }
   }
 
-  async function saveAll() {
-    // Save budgets first, then spend (so alerts reflect any new limits)
-    await saveBudget();
-    await saveSpend();
-  }
-
-  function removeRow(cat: string) {
-    setRows(prev => prev.filter(r => r.category !== cat));
-  }
 
   return (
     <div className="page">
@@ -318,7 +346,22 @@ export default function App() {
           <h1>Spending Insights</h1>
           <p className="sub">Simple budgets with a serverless Java backend</p>
         </div>
-        <div className="hdr-actions">
+        <div className="hdr-actions" style={{ display: "flex", gap: 8, alignItems: "center" }}>
+          {clientId ? (
+            <PlaidLinkButton
+              clientId={clientId}
+              onLinked={() => pushToast({ kind: "ok", msg: "Plaid link successful" })}
+              onSynced={(n) => {
+                pushToast({ kind: "ok", msg: `Synced ${n} transactions` });
+                loadTxFirstPage();
+                loadBudgets();
+              }}
+            />
+          ) : (
+            <button className="btn" disabled>
+              Loading…
+            </button>
+          )}
           <button className="btn ghost" onClick={testAPI}>
             Test API
           </button>
@@ -335,7 +378,7 @@ export default function App() {
               <CategoryPicker
                 value={form.category}
                 onChange={(v) => onChange("category", v)}
-                options={rows.map(r => r.category)}
+                options={rows.map((r) => r.category)}
               />
             </div>
             <div className="field">
@@ -345,11 +388,16 @@ export default function App() {
                 min={0}
                 step={1}
                 value={form.monthly_limit}
-                onChange={e => onChange("monthly_limit", e.target.value)}
+                onChange={(e) => onChange("monthly_limit", e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") addRowLocal();
+                }}
               />
             </div>
             <div className="actions">
-              <button className="btn" onClick={addRowLocal}>Add / Update</button>
+              <button className="btn" onClick={addRowLocal} disabled={savingBudget}>
+                {savingBudget ? "Saving…" : "Add / Update"}
+              </button>
             </div>
           </div>
         </section>
@@ -372,33 +420,25 @@ export default function App() {
                     <tr>
                       <th>Category</th>
                       <th className="num">Monthly Limit</th>
-                      <th className="num">Current Spend</th>
+                      <th className="num">Current Spend (auto)</th>
                       <th>Status</th>
                       <th />
                     </tr>
                   </thead>
                   <tbody>
-                    {rows.map(r => {
-                      const amt = spend[r.category] ?? 0;
+                    {rows.map((r) => {
+                      const amt = Number(r.current_spend ?? 0);          // ← MTD spend from API (dollars)
                       const status =
                         amt >= r.monthly_limit ? "OVER" :
                         amt >= 0.8 * r.monthly_limit ? "WARNING" : "OK";
+
                       return (
                         <tr key={r.category} className={status !== "OK" ? `row-${status.toLowerCase()}` : ""}>
                           <td>{r.category}</td>
-                          <td className="num">${Number(r.monthly_limit).toFixed(2)}</td>
-                          <td className="num">
-                            <input
-                              className="input num-input"
-                              type="number"
-                              min={0}
-                              step={1}
-                              value={amt}
-                              onChange={e => setSpend(s => ({ ...s, [r.category]: Number(e.target.value || 0) }))}
-                            />
-                          </td>
+                          <td className="num">{formatCurrency(Number(r.monthly_limit))}</td>
+                          <td className="num">{formatCurrency(amt)}</td>   {/* ← show current spend */}
                           <td>
-                            <span className={`chip ${status === "OK" ? "ok" : status === "WARNING" ? "" : "err"}`}>
+                            <span className={`chip ${status === "OK" ? "ok" : status === "WARNING" ? "" : "err"}`} title={`Local calc: ${status}`}>
                               {status}
                             </span>
                           </td>
@@ -412,26 +452,33 @@ export default function App() {
                   <tfoot>
                     <tr>
                       <td className="right strong">Total</td>
-                      <td className="num strong">${total.toFixed(2)}</td>
+                      <td className="num strong">{formatCurrency(total)}</td>
                       <td />
                     </tr>
                   </tfoot>
                 </table>
               </div>
-              <div className="row-end">
-                <button className="btn primary" onClick={saveAll}>Save All</button>
-              </div>
             </>
           )}
         </section>
 
+        <TransactionsCard
+          rows={txRows}
+          next={txNext}
+          loading={txLoading}
+          initialized={txInit}
+          onRefresh={loadTxFirstPage}
+          onLoadMore={loadTxMore}
+        />
+
         {rows.length > 0 && (
           <section className="card" style={{ gridColumn: "1 / -1" }}>
-            <h2 className="card-title" style={{ marginBottom: 8 }}>Visualizations</h2>
+            <h2 className="card-title" style={{ marginBottom: 8 }}>
+              Visualizations
+            </h2>
             <BudgetCharts data={chartData} />
           </section>
         )}
-
       </main>
 
       <Toasts toasts={toasts} />
@@ -442,17 +489,13 @@ export default function App() {
 
 function StatusChip({ health }: { health: null | { ok: boolean; text: string } }) {
   if (!health) return <span className="chip">No check</span>;
-  return (
-    <span className={`chip ${health.ok ? "ok" : "err"}`}>
-      {health.ok ? "API OK" : "API Error"}
-    </span>
-  );
+  return <span className={`chip ${health.ok ? "ok" : "err"}`}>{health.ok ? "API OK" : "API Error"}</span>;
 }
 
 function Toasts({ toasts }: { toasts: Toast[] }) {
   return (
     <div className="toasts">
-      {toasts.map(t => (
+      {toasts.map((t) => (
         <div key={t.id} className={`toast ${t.kind}`}>
           {t.msg}
         </div>

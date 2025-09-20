@@ -21,3 +21,21 @@ variable "allowed_origins" {
   type    = string
   default = "*"
 }
+
+variable "plaid_client_id" {
+  type = string
+}
+
+variable "plaid_secret" {
+  type = string
+}
+
+variable "plaid_env" {
+  type    = string
+  default = "SANDBOX"
+}
+
+variable "plaid_webhook_url" {
+  type    = string
+  default = ""
+}

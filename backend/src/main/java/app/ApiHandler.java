@@ -2,9 +2,16 @@ package app;
 
 import com.amazonaws.services.lambda.runtime.Context;
 import com.amazonaws.services.lambda.runtime.RequestHandler;
+import com.amazonaws.services.lambda.runtime.events.APIGatewayProxyResponseEvent;
 import com.amazonaws.services.lambda.runtime.events.APIGatewayV2HTTPEvent;
 import com.amazonaws.services.lambda.runtime.events.APIGatewayV2HTTPResponse;
 import com.fasterxml.jackson.databind.ObjectMapper;
+
+import app.plaid.CreateLinkTokenHandler;
+import app.plaid.ExchangePublicTokenHandler;
+import app.plaid.PlaidWebhookHandler;
+import app.plaid.SyncTransactionsHandler;
+
 import org.postgresql.ds.PGSimpleDataSource;
 
 import javax.sql.DataSource;
@@ -20,9 +27,9 @@ public class ApiHandler implements RequestHandler<APIGatewayV2HTTPEvent, APIGate
 
   private static DataSource initDS() {
     PGSimpleDataSource ds = new PGSimpleDataSource();
-    ds.setURL(System.getenv("JDBC_URL")); // jdbc:postgresql://.../db?sslmode=require
-    ds.setUser(System.getenv("DB_USER"));
-    ds.setPassword(System.getenv("DB_PASSWORD"));
+    ds.setURL(System.getenv("jdbc_url")); // jdbc:postgresql://.../db?sslmode=require
+    ds.setUser(System.getenv("db_user"));
+    ds.setPassword(System.getenv("db_pass"));
     return ds;
   }
 
@@ -62,15 +69,43 @@ public class ApiHandler implements RequestHandler<APIGatewayV2HTTPEvent, APIGate
           return corsJson(400, Map.of("error", "client_id required"));
         }
         List<Map<String, Object>> rows = new ArrayList<>();
+
+        // MTD spend per category (posted only). Assumes expenses are stored as positive cents.
+        // If your expenses are negative, change the CASE to "WHEN t.amount_cents < 0 THEN -t.amount_cents ELSE 0".
+        String sql =
+          "WITH bounds AS (\n" +
+          "  SELECT date_trunc('month', CURRENT_DATE)::date AS start_date,\n" +
+          "         CURRENT_DATE::date AS end_date\n" +
+          ")\n" +
+          "SELECT b.category,\n" +
+          "       b.monthly_limit,\n" +
+          "       (GREATEST(COALESCE(SUM(t.amount_cents), 0), 0) / 100.0) AS current_spend\n" +  // net of refunds, floored at 0
+          "FROM budget b\n" +
+          "LEFT JOIN transactions t\n" +
+          "  ON t.client_id = b.client_id\n" +
+          " AND t.category  = b.category\n" +
+          " AND t.post_date BETWEEN (SELECT start_date FROM bounds) AND (SELECT end_date FROM bounds)\n" +
+          " AND COALESCE(t.status,'') <> 'PENDING'\n" +
+          "WHERE b.client_id = ?::uuid\n" +
+          "GROUP BY b.category, b.monthly_limit\n" +
+          "ORDER BY b.category";
+
         try (Connection conn = DS.getConnection();
-             PreparedStatement ps = conn.prepareStatement("select category, monthly_limit from budget where client_id = ? order by category")) {
+            PreparedStatement ps = conn.prepareStatement(sql)) {
           ps.setObject(1, java.util.UUID.fromString(clientId));
           try (ResultSet rs = ps.executeQuery()) {
             while (rs.next()) {
-              rows.add(Map.of("category", rs.getString(1), "monthly_limit", rs.getBigDecimal(2)));
+              rows.add(Map.of(
+                "category",      rs.getString("category"),
+                "monthly_limit", rs.getBigDecimal("monthly_limit"), // dollars
+                "current_spend", rs.getBigDecimal("current_spend")  // dollars (MTD)
+              ));
             }
           }
+        } catch (Exception e) {
+          return corsJson(500, Map.of("error", e.getMessage()));
         }
+
         return corsJson(200, rows);
       }
 
@@ -115,93 +150,100 @@ public class ApiHandler implements RequestHandler<APIGatewayV2HTTPEvent, APIGate
 
       }
 
-      // POST /v1/spend  -> upsert spend_current rows
-      if ("POST".equalsIgnoreCase(method) && "/v1/spend".equals(path)) {
-        Models.SpendUpsert payload = M.readValue(req.getBody(), Models.SpendUpsert.class);
-        if (payload.client_id == null || payload.client_id.isBlank()) {
-          return corsJson(400, Map.of("error", "client_id required"));
+      // DELETE /v1/budgets?client_id=...&category=...
+      if ("DELETE".equalsIgnoreCase(method) && "/v1/budgets".equals(path)) {
+        Map<String,String> q = req.getQueryStringParameters()==null ? Map.of() : req.getQueryStringParameters();
+        String clientId = q.get("client_id"), category = q.get("category");
+        if (clientId==null || clientId.isBlank()) return corsJson(400, Map.of("error","client_id required"));
+        if (category==null || category.isBlank()) return corsJson(400, Map.of("error","category required"));
+
+        int deleted = 0;
+        try (Connection conn = DS.getConnection();
+            PreparedStatement ps = conn.prepareStatement(
+              "DELETE FROM budget WHERE client_id = ?::uuid AND category = ?")) {
+          ps.setObject(1, java.util.UUID.fromString(clientId));
+          ps.setString(2, category);
+          deleted = ps.executeUpdate();
+        } catch (Exception e) {
+          return corsJson(500, Map.of("error", e.getMessage()));
         }
-        java.util.UUID cid;
-        try { cid = java.util.UUID.fromString(payload.client_id); }
-        catch (Exception e) { return corsJson(400, Map.of("error", "client_id must be a UUID v4")); }
-
-        try (Connection conn = DS.getConnection()) {
-          conn.setAutoCommit(false);
-
-          // ensure client exists (your client PK column is client_id)
-          try (PreparedStatement psC = conn.prepareStatement(
-            "insert into client(client_id) values (?) on conflict (client_id) do nothing")) {
-            psC.setObject(1, cid);
-            psC.executeUpdate();
-          }
-
-          // upsert spend_current
-          try (PreparedStatement ps = conn.prepareStatement(
-            "insert into spend_current(client_id, category, amount) values (?, ?, ?) " +
-            "on conflict (client_id, category) do update set amount = excluded.amount")) {
-            if (payload.items != null) {
-              for (Models.SpendUpsert.Item it : payload.items) {
-                ps.setObject(1, cid);
-                ps.setString(2, it.category);
-                ps.setBigDecimal(3, it.amount);
-                ps.addBatch();
-              }
-              ps.executeBatch();
-            }
-          }
-
-          conn.commit();
-        } catch (Exception ex) {
-          return corsJson(500, Map.of("error", ex.getMessage()));
-        }
-        return corsJson(200, Map.of("status", "ok"));
+        return corsJson(200, Map.of("status","ok","deleted",deleted));
       }
 
-      // GET /v1/insights?client_id=UUID  -> join budgets with spend + status
-      if ("GET".equalsIgnoreCase(method) && "/v1/insights".equals(path)) {
-        Map<String, String> q = req.getQueryStringParameters();
-        String clientId = (q != null) ? q.get("client_id") : null;
+      // POST /api/plaid/link-token/create
+      if ("POST".equalsIgnoreCase(method) && "/api/plaid/link-token/create".equals(path)) {
+        Map<String,Object> in = Map.of("body", req.getBody() == null ? "{}" : req.getBody());
+        APIGatewayProxyResponseEvent r = new CreateLinkTokenHandler().handleRequest(in, ctx);
+        APIGatewayV2HTTPResponse resp = adapt(r);
+        return resp;
+      }
+
+      // POST /api/plaid/item/public_token/exchange
+      if ("POST".equalsIgnoreCase(method) && "/api/plaid/item/public_token/exchange".equals(path)) {
+        Map<String,Object> in = Map.of("body", req.getBody() == null ? "{}" : req.getBody());
+        APIGatewayProxyResponseEvent r = new ExchangePublicTokenHandler().handleRequest(in, ctx);
+        APIGatewayV2HTTPResponse resp = adapt(r);
+        ctx.getLogger().log("[DBG] /api/plaid/item/public_token/exchange resp headers: " + resp.getHeaders() + "\n");
+        return resp;
+      }
+
+      // POST /api/plaid/transactions/sync
+      if ("POST".equalsIgnoreCase(method) && "/api/plaid/transactions/sync".equals(path)) {
+        Map<String,Object> in = Map.of("body", req.getBody() == null ? "{}" : req.getBody());
+        APIGatewayProxyResponseEvent r = new SyncTransactionsHandler().handleRequest(in, ctx);
+        APIGatewayV2HTTPResponse resp = adapt(r);
+        ctx.getLogger().log("[DBG] /api/plaid/transactions/sync resp headers: " + resp.getHeaders() + "\n");
+        return resp;
+      }
+
+      // POST /webhooks/plaid
+      if ("POST".equalsIgnoreCase(method) && "/webhooks/plaid".equals(path)) {
+        Map<String,Object> in = Map.of("body", req.getBody() == null ? "{}" : req.getBody());
+        APIGatewayProxyResponseEvent r = new PlaidWebhookHandler().handleRequest(in, ctx);
+        APIGatewayV2HTTPResponse resp = adapt(r);
+        ctx.getLogger().log("[DBG] /webhooks/plaid resp headers: " + resp.getHeaders() + "\n");
+        return resp;
+      }
+
+      if ("GET".equalsIgnoreCase(method) && "/v1/transactions".equals(path)) {
+        Map<String, String> q = req.getQueryStringParameters() == null ? Map.of() : req.getQueryStringParameters();
+        String clientId = q.get("client_id");
         if (clientId == null || clientId.isBlank()) {
           return corsJson(400, Map.of("error", "client_id required"));
         }
-        java.util.UUID cid;
-        try { cid = java.util.UUID.fromString(clientId); }
-        catch (Exception e) { return corsJson(400, Map.of("error", "client_id must be a UUID v4")); }
+        // Forward query params to the sub-handler (v1-style input)
+        Map<String,Object> forward = new HashMap<>();
+        forward.put("queryStringParameters", q);
 
-        String sql =
-          "select b.category, b.monthly_limit, coalesce(s.amount,0) as spent, " +
-          "case " +
-          "  when coalesce(s.amount,0) >= b.monthly_limit then 'OVER' " +
-          "  when coalesce(s.amount,0) >= 0.8*b.monthly_limit then 'WARNING' " +
-          "  else 'OK' " +
-          "end as status " +
-          "from budget b " +
-          "left join spend_current s on s.client_id=b.client_id and s.category=b.category " +
-          "where b.client_id = ? " +
-          "order by b.category asc";
-
-        java.util.List<Map<String,Object>> out = new java.util.ArrayList<>();
-        try (Connection conn = DS.getConnection();
-            PreparedStatement ps = conn.prepareStatement(sql)) {
-          ps.setObject(1, cid);
-          try (ResultSet rs = ps.executeQuery()) {
-            while (rs.next()) {
-              Map<String,Object> row = new java.util.HashMap<>();
-              row.put("category", rs.getString("category"));
-              row.put("monthly_limit", rs.getBigDecimal("monthly_limit"));
-              row.put("spent", rs.getBigDecimal("spent"));
-              row.put("status", rs.getString("status"));
-              out.add(row);
-            }
-          }
-        }
-        return corsJson(200, out);
+        APIGatewayProxyResponseEvent r = new ListTransactionsHandler().handleRequest(forward, ctx);
+        return adapt(r);
       }
 
       return corsJson(404, Map.of("error", "not found"));
     } catch (Exception e) {
       return corsJson(500, Map.of("error", e.getMessage()));
     }
+  }
+
+  private static APIGatewayV2HTTPResponse adapt(APIGatewayProxyResponseEvent v1) {
+    Map<String, String> h = new HashMap<>(corsHeaders());
+    if (v1.getHeaders() != null) {
+        h.putAll(v1.getHeaders());
+    }
+    return APIGatewayV2HTTPResponse.builder()
+        .withStatusCode(v1.getStatusCode() == null ? 200 : v1.getStatusCode())
+        .withHeaders(h)
+        .withBody(v1.getBody())
+        .build();
+  }
+
+  private static Map<String,String> corsHeaders() {
+    Map<String,String> h = new HashMap<>();
+    h.put("Content-Type","application/json");
+    h.put("Access-Control-Allow-Origin", ALLOWED_ORIGINS);
+    h.put("Access-Control-Allow-Headers","Content-Type, Authorization");
+    h.put("Access-Control-Allow-Methods","GET,POST,DELETE,OPTIONS");
+    return h;
   }
 
   private static APIGatewayV2HTTPResponse corsJson(int code, Object obj) {
@@ -218,7 +260,7 @@ public class ApiHandler implements RequestHandler<APIGatewayV2HTTPEvent, APIGate
     headers.put("Content-Type", "application/json");
     headers.put("Access-Control-Allow-Origin", ALLOWED_ORIGINS);
     headers.put("Access-Control-Allow-Headers", "Content-Type, Authorization");
-    headers.put("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+    headers.put("Access-Control-Allow-Methods", "GET,POST,DELETE,OPTIONS");
     return APIGatewayV2HTTPResponse.builder()
         .withStatusCode(code)
         .withHeaders(headers)

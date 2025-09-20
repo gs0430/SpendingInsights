@@ -27,8 +27,9 @@ body {
 
 /* Layout */
 .page {
-  max-width: 1080px;
-  margin: 0 auto;
+  width: 100%;
+  max-width: none;
+  margin: 0;              /* no horizontal centering */
   padding: 24px 16px 56px;
 }
 
@@ -364,3 +365,40 @@ tr.row-over td     { background: rgba(255, 92, 92, 0.10); }
 .combo-item:last-child { border-bottom: 0; }
 .combo-item.hl { background: rgba(77,163,255,0.12); }
 .combo-item.add { color: var(--muted); font-style: italic; }
+
+/* Make table cells clip long text instead of growing the row */
+.tbl { table-layout: fixed; width: 100%; }
+.tbl th, .tbl td {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Helper for cells where you want tooltip + ellipsis */
+.cell-clip {
+  display: inline-block;
+  max-width: 100%;
+  vertical-align: top;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Optional: a simple custom tooltip (nicer than the default 'title') */
+.cell-clip[data-full]:hover::after {
+  content: attr(data-full);
+  position: fixed;           /* avoids overflow issues */
+  top: var(--tt-y, 0);       /* set via JS (below) for cursor-follow */
+  left: var(--tt-x, 0);
+  transform: translate(10px, 10px);
+  background: #111;
+  color: #fff;
+  padding: 6px 8px;
+  border-radius: 6px;
+  font-size: 12px;
+  line-height: 1.2;
+  z-index: 9999;
+  max-width: 60vw;
+  pointer-events: none;
+  box-shadow: 0 4px 16px rgba(0,0,0,.2);
+}

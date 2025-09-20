@@ -4,17 +4,22 @@ resource "aws_lambda_function" "api" {
   handler       = "app.ApiHandler::handleRequest"
   runtime       = "java17"
   memory_size   = 256
-  timeout       = 10
+  timeout       = 30
 
   filename         = var.lambda_zip_path
   source_code_hash = filebase64sha256(var.lambda_zip_path)
 
   environment {
     variables = {
-      JDBC_URL        = var.jdbc_url
-      DB_USER         = var.db_user
-      DB_PASSWORD     = var.db_pass
+      jdbc_url        = var.jdbc_url
+      db_user         = var.db_user
+      db_pass         = var.db_pass
       ALLOWED_ORIGINS = var.allowed_origins
+
+      plaid_client_id  = var.plaid_client_id
+      plaid_secret     = var.plaid_secret
+      plaid_env        = var.plaid_env           
+      plaid_webhook_url = var.plaid_webhook_url
     }
   }
 }
@@ -24,7 +29,7 @@ resource "aws_apigatewayv2_api" "api" {
   protocol_type = "HTTP"
   cors_configuration {
     allow_origins = split(",", var.allowed_origins)
-    allow_methods = ["GET", "POST", "OPTIONS"]
+    allow_methods = ["GET", "POST", "DELETE", "OPTIONS"]
     allow_headers = ["content-type", "authorization"]
   }
 }
@@ -54,18 +59,16 @@ resource "aws_apigatewayv2_route" "post_budgets" {
   target    = "integrations/${aws_apigatewayv2_integration.lambda_integ.id}"
 }
 
-resource "aws_apigatewayv2_route" "post_spend" {
-  api_id             = aws_apigatewayv2_api.api.id
-  route_key          = "POST /v1/spend"
-  authorization_type = "NONE"
-  target             = "integrations/${aws_apigatewayv2_integration.lambda_integ.id}"
+resource "aws_apigatewayv2_route" "delete_budgets" {
+  api_id    = aws_apigatewayv2_api.api.id
+  route_key = "DELETE /v1/budgets"
+  target    = "integrations/${aws_apigatewayv2_integration.lambda_integ.id}"
 }
 
-resource "aws_apigatewayv2_route" "get_insights" {
-  api_id             = aws_apigatewayv2_api.api.id
-  route_key          = "GET /v1/insights"
-  authorization_type = "NONE"
-  target             = "integrations/${aws_apigatewayv2_integration.lambda_integ.id}"
+resource "aws_apigatewayv2_route" "get_transactions" {
+  api_id    = aws_apigatewayv2_api.api.id
+  route_key = "GET /v1/transactions"
+  target    = "integrations/${aws_apigatewayv2_integration.lambda_integ.id}"
 }
 
 resource "aws_lambda_permission" "allow_apigw" {

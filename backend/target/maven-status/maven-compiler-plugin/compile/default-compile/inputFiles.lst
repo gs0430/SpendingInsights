@@ -1,2 +1,10 @@
 C:\Users\Gagan\Desktop\Spending Insights\backend\src\main\java\app\ApiHandler.java
+C:\Users\Gagan\Desktop\Spending Insights\backend\src\main\java\app\common\Db.java
+C:\Users\Gagan\Desktop\Spending Insights\backend\src\main\java\app\ListTransactionsHandler.java
 C:\Users\Gagan\Desktop\Spending Insights\backend\src\main\java\app\Models.java
+C:\Users\Gagan\Desktop\Spending Insights\backend\src\main\java\app\plaid\CreateLinkTokenHandler.java
+C:\Users\Gagan\Desktop\Spending Insights\backend\src\main\java\app\plaid\ExchangePublicTokenHandler.java
+C:\Users\Gagan\Desktop\Spending Insights\backend\src\main\java\app\plaid\PlaidClientFactory.java
+C:\Users\Gagan\Desktop\Spending Insights\backend\src\main\java\app\plaid\PlaidWebhookHandler.java
+C:\Users\Gagan\Desktop\Spending Insights\backend\src\main\java\app\plaid\SyncTransactionsHandler.java
+C:\Users\Gagan\Desktop\Spending Insights\backend\src\main\java\app\plaid\TxUpsertService.java
